@@ -7,7 +7,9 @@ import copy
 # import onnx
 import onnxruntime
 import datetime
-
+import os
+import json
+import pickle
 
 from unitree_sdk2py.core.channel import ChannelPublisher, ChannelFactoryInitialize
 from unitree_sdk2py.core.channel import ChannelSubscriber, ChannelFactoryInitialize
@@ -25,11 +27,24 @@ from common.remote_controller import RemoteController, KeyMap
 from config import Config
 
 
+
 class Controller:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.remote_controller = RemoteController()
-
+        # 构建数据字典
+        self.data_dict = {
+            'root_trans_offset': [],
+            'base_lin_vel': [],
+            'pose_aa': [],
+            'dof': [],
+            'dof_vel': [],
+            'root_rot': [],
+            'base_quat': [],
+            'base_ang_vel': [],
+            'smpl_joints': [],
+            'fps': 30,
+        }
         # Initialize the policy network
         # pytorch script
         # self.policy = torch.jit.load(config.policy_path)
@@ -60,6 +75,7 @@ class Controller:
         self.dof_vel_buf = np.zeros(config.num_actions * config.history_length, dtype=np.float32)
         self.action_buf = np.zeros(config.num_actions * config.history_length, dtype=np.float32)
         self.ref_motion_phase_buf = np.zeros(1 * config.history_length, dtype=np.float32)
+        self.base_lin_vel = np.array([0.0, 0.0, 0.0], dtype=np.float32)
 
 
         if config.msg_type == "hg":
@@ -120,7 +136,6 @@ class Controller:
     def zero_torque_state(self):
         print("Enter zero torque state.")
         print("Waiting for the start signal...")
-        
         while self.remote_controller.button[KeyMap.start] != 1:
             create_zero_cmd(self.low_cmd)
             self.send_cmd(self.low_cmd)
@@ -187,6 +202,26 @@ class Controller:
             self.send_cmd(self.low_cmd)
             time.sleep(self.config.control_dt)
 
+    def input_onnx(self, target):
+        for i in range(17, 21):
+            target[i] = target[i + 1].copy()
+
+        for i in range(20, 12, -1):
+            target[i + 2] = target[i].copy()
+
+        target[13] = 0
+        target[14] = 0
+        
+    def output_onnx(self, target):
+        for i in range(13, 21):
+            target[i] = target[i + 2].copy()
+        
+        for i in range(20, 16, -1):
+            target[i + 1] = target[i].copy()
+
+        target[17] = 0
+        target[22] = 0
+        
     def resort_sub(self):
         # 将索引15~26的数据向前移两格
         for i in range(15, 27, 1):
@@ -293,6 +328,10 @@ class Controller:
         # print(f"history_obs_buf shape: {np.array(history_obs_buf).shape}")
         print(f"projected_gravity shape: {np.array(projected_gravity).shape}")
         print(f"[self.ref_motion_phase] shape: {np.array([self.ref_motion_phase]).shape}")
+        
+        self.input_onnx(dof_pos)
+        self.input_onnx(dof_vel)
+        self.input_onnx(self.action)
 
         history_obs_buf = np.concatenate((self.action_buf, self.ang_vel_buf, self.dof_pos_buf, self.dof_vel_buf, self.proj_g_buf, self.ref_motion_phase_buf), axis=-1, dtype=np.float32)
         
@@ -326,7 +365,9 @@ class Controller:
         self.read_data()
         obs_tensor = torch.from_numpy(obs_buf).unsqueeze(0).cpu().numpy()
         self.action = np.squeeze(self.ort_session.run(None, {self.input_name: obs_tensor})[0])
+        
 
+        self.output_onnx(self.action)
 
         # self.action = self.policy(obs_tensor).detach().numpy().squeeze()
         
@@ -352,15 +393,15 @@ class Controller:
             self.low_cmd.motor_cmd[motor_idx].tau = 0
         self.resort_pub()
 
-        for i in range(len(self.low_cmd.motor_cmd)):
-            print(f"low_cmd.motor_cmd: {i}  ", self.low_cmd.motor_cmd[i])        
+        # for i in range(len(self.low_cmd.motor_cmd)):
+        #     print(f"low_cmd.motor_cmd: {i}  ", self.low_cmd.motor_cmd[i])        
         # send the command
         self.send_cmd(self.low_cmd)
 
         time.sleep(self.config.control_dt)
-
+        
     def read_data(self):
-        # 基向量位移(可以没有)
+        # 基向量位移root_trams_offset(可以没有)
         # 连杆位姿 pose_aa(可以没有)
         # dof(就是dof_pos就是关节位置)(qj)
         # 基向量的旋转四元组root_rot(quat)
@@ -368,47 +409,37 @@ class Controller:
         # dof_vel是关节速度(dqj)
         # base_lin_vel
         # base_ang_vel
+        root_trans_offset = [0.0, 0.0, 0.0]
+        pose_aa = [0.0, 0.0, 0.0]
         dof_pos = self.qj.copy() * self.config.dof_pos_scale
         quat = self.low_state.imu_state.quaternion
         dof_vel = dqj = self.dqj.copy() * self.config.dof_vel_scale
+        base_lin_acc = np.array([self.low_state.imu_state.accelerometer], dtype=np.float32)
+        self.base_lin_vel = self.base_lin_vel + base_lin_acc * self.config.control_dt
         base_ang_vel = np.array([self.low_state.imu_state.gyroscope], dtype=np.float32) * self.config.ang_vel_scale
+        root_rot = [0.0, 0.0, 0.0]
         fps = int(1 / self.config.control_dt)
+        smpl_joints = np.zeros((24, 3), dtype=np.float32)
         # 生成带时间戳的文件名（精确到分钟）
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
         policy_path = self.policy_path.split("/")[-1].split(".")[0]
-        filename = f"/home/zy/桌面/{policy_path}_{timestamp}.txt"
+        filename = f"/home/zy/桌面/{policy_path}/{policy_path}_{timestamp}.pkl"
+        try:
+            os.makedirs(f"/home/zy/桌面/{policy_path}")
+        except Exception as e:
+            pass
+        self.data_dict['root_trans_offset'].append(root_trans_offset)
+        self.data_dict['base_lin_vel'].append(self.base_lin_vel.tolist())
+        self.data_dict['pose_aa'].append(pose_aa)
+        self.data_dict['dof'].append(dof_pos.tolist())
+        self.data_dict['dof_vel'].append(dof_vel.tolist())
+        self.data_dict['root_rot'].append(root_rot)
+        self.data_dict['base_quat'].append(quat)
+        self.data_dict['base_ang_vel'].append(base_ang_vel.tolist())
+        self.data_dict['smpl_joints'].append(smpl_joints.tolist())
+        with open(filename, 'wb') as f:
+            pickle.dump(self.data_dict, f)
 
-        # 写入数据到文件
-        with open(filename, 'a') as f:
-            f.write(f"===== [记录时间]{self.counter} =====\n")
-
-            # 写入关节位置(dof_pos)
-            f.write("\n[关节位置dof]\n")
-            for i, pos in enumerate(dof_pos):
-                f.write(f"关节{i + 1}: {pos:.6f}\n")
-
-                # 写入基向量旋转四元组
-            f.write("\n[基向量的旋转四元组root_rot]\n")
-            f.write(f"w: {quat[0]:.6f}\n")
-            f.write(f"x: {quat[1]:.6f}\n")
-            f.write(f"y: {quat[2]:.6f}\n")
-            f.write(f"z: {quat[3]:.6f}\n")
-
-            # 写入关节速度(dof_vel)
-            f.write("\n[关节速度dof_vel]\n")
-            for i, vel in enumerate(dof_vel):
-                f.write(f"关节{i + 1}速度: {vel:.6f}\n")
-
-            # 写入角速度
-            f.write("\n[基向量角速度base_ang_vel]\n")
-            f.write(f"x轴角速度: {base_ang_vel[0][0]:.6f}\n")
-            f.write(f"y轴角速度: {base_ang_vel[0][1]:.6f}\n")
-            f.write(f"z轴角速度: {base_ang_vel[0][2]:.6f}\n")
-
-            # 写入频率
-            f.write("\n[频率fps]\n")
-            f.write(f"\nFPS: {fps} Hz\n")
-        return filename
 
 if __name__ == "__main__":
     import argparse
@@ -429,7 +460,6 @@ if __name__ == "__main__":
 
     # Enter the zero torque state, press the start key to continue executing
     controller.zero_torque_state()
-
     # Move to the default position
     controller.move_to_default_pos()
 
